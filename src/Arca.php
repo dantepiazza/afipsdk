@@ -102,6 +102,24 @@ class Arca {
 
 	var $AdminClient;
 
+	/**
+	 * Persistencia del TA — ver TaStorage.php. Default: FileTaStorage
+	 * (comportamiento de siempre). Un consumidor pasa la suya vía
+	 * $options['ta_storage'] para cachear en DB en vez de archivo.
+	 *
+	 * @var TaStorage
+	 **/
+	var $taStorage;
+
+	/**
+	 * Rutas a los archivos temporales de cert/key cuando se usa el modo
+	 * "por contenido" ($options['cert_content']/['private_key_content'])
+	 * en vez de archivos ya existentes en res_folder — se limpian solas en
+	 * __destruct().
+	 **/
+	private $tempCertPath;
+	private $tempKeyPath;
+
 	function __construct($options)
 	{
 		ini_set("soap.wsdl_cache_enabled", "0");
@@ -148,8 +166,25 @@ class Arca {
 
 		$this->options = $options;
 
-		$this->CERT 		= $this->RES_FOLDER.$options['cert'];
-		$this->PRIVATEKEY 	= $this->RES_FOLDER.$options['key'];
+		// Modo "por contenido" (cert_content/private_key_content, ej. leídos
+		// de una DB) en vez del modo de siempre (res_folder + nombre de
+		// archivo) — openssl_pkcs7_sign() solo acepta rutas reales ("file://"),
+		// así que igual hace falta un archivo en disco; queda como temporal,
+		// propio de esta instancia, limpiado en __destruct(). 100%
+		// retrocompatible: si no vienen estas 2 keys, se comporta exactamente
+		// igual que antes.
+		if (isset($options['cert_content']) && isset($options['private_key_content'])) {
+			$this->tempCertPath = $this->writeTempSecret($options['cert_content'], 'arcasdk_cert_');
+			$this->tempKeyPath  = $this->writeTempSecret($options['private_key_content'], 'arcasdk_key_');
+
+			$this->CERT 		= $this->tempCertPath;
+			$this->PRIVATEKEY 	= $this->tempKeyPath;
+		} else {
+			$this->CERT 		= $this->RES_FOLDER.$options['cert'];
+			$this->PRIVATEKEY 	= $this->RES_FOLDER.$options['key'];
+		}
+
+		$this->taStorage = $options['ta_storage'] ?? new FileTaStorage($this->TA_FOLDER);
 
 		$this->WSAA_WSDL 	= __DIR__.'/resources/'.'wsaa.wsdl';
 		if ($options['production'] === TRUE) {
@@ -158,12 +193,31 @@ class Arca {
 			$this->WSAA_URL = 'https://wsaahomo.afip.gov.ar/ws/services/LoginCms';
 		}
 
-		if (!file_exists($this->CERT)) 
+		if (!file_exists($this->CERT))
 			throw new Exception("Failed to open ".$this->CERT."\n", 1);
-		if (!file_exists($this->PRIVATEKEY)) 
+		if (!file_exists($this->PRIVATEKEY))
 			throw new Exception("Failed to open ".$this->PRIVATEKEY."\n", 2);
-		if (!file_exists($this->WSAA_WSDL)) 
+		if (!file_exists($this->WSAA_WSDL))
 			throw new Exception("Failed to open ".$this->WSAA_WSDL."\n", 3);
+	}
+
+	function __destruct()
+	{
+		if ($this->tempCertPath && file_exists($this->tempCertPath)) {
+			@unlink($this->tempCertPath);
+		}
+		if ($this->tempKeyPath && file_exists($this->tempKeyPath)) {
+			@unlink($this->tempKeyPath);
+		}
+	}
+
+	private function writeTempSecret(string $content, string $prefix): string
+	{
+		$path = tempnam(sys_get_temp_dir(), $prefix);
+		file_put_contents($path, $content);
+		chmod($path, 0600);
+
+		return $path;
 	}
 
 	/**
@@ -179,19 +233,21 @@ class Arca {
 	**/
 	public function GetServiceTA($service, $continue = TRUE)
 	{
-		if (file_exists($this->TA_FOLDER.'TA-'.$this->options['CUIT'].'-'.$service.($this->options['production'] === TRUE ? '-production' : '').'.xml')) {
-			$TA = new SimpleXMLElement(file_get_contents($this->TA_FOLDER.'TA-'.$this->options['CUIT'].'-'.$service.($this->options['production'] === TRUE ? '-production' : '').'.xml'));
+		$cached = $this->taStorage->get($this->options['CUIT'], $service, $this->options['production'] === TRUE);
+
+		if ($cached !== null) {
+			$TA = new SimpleXMLElement($cached);
 
 			$actual_time 		= new DateTime(date('c',date('U')+600));
 			$expiration_time 	= new DateTime($TA->header->expirationTime);
 
-			if ($actual_time < $expiration_time) 
+			if ($actual_time < $expiration_time)
 				return new TokenAuthorization($TA->credentials->token, $TA->credentials->sign);
 			else if ($continue === FALSE)
 				throw new Exception("Error Getting TA", 5);
 		}
 
-		if ($this->CreateServiceTA($service)) 
+		if ($this->CreateServiceTA($service))
 			return $this->GetServiceTA($service, FALSE);
 	}
 
@@ -255,10 +311,9 @@ class Arca {
 
 		$TA = $results->loginCmsReturn;
 
-		if (file_put_contents($this->TA_FOLDER.'TA-'.$this->options['CUIT'].'-'.$service.($this->options['production'] === TRUE ? '-production' : '').'.xml', $TA)) 
-			return TRUE;
-		else
-			throw new Exception('Error writing "TA-'.$this->options['CUIT'].'-'.$service.'.xml"', 5);
+		$this->taStorage->put($this->options['CUIT'], $service, $this->options['production'] === TRUE, $TA);
+
+		return TRUE;
 	}
 
 	/**
